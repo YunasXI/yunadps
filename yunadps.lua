@@ -1,6 +1,6 @@
 addon.name    = 'yunadps';
 addon.author  = 'Yunas';
-addon.version = '1.0.0';
+addon.version = '1.0.1';
 addon.desc    = 'YunaDPS: damage meter for CatsEyeXI in the YunaGearOpt look. Minimizes to the YGO logo.';
 addon.link    = '';
 
@@ -443,6 +443,44 @@ function hate.rows(m)
     return out;
 end
 
+-- Abilities whose server script moves enmity instead of adding it (LandSandBoat scripts/globals/job_utils):
+--   Enmity Douse (BLM, 272): your enmity on that monster -> CE 1, VE 0
+--   High Jump (DRG, 67): your enmity on it -50% (DRG main job) or -30% (DRG sub)
+--   Super Jump (DRG, 68): your enmity on every monster -> CE 1, VE 0
+--   Accomplice (THF, 84) / Collaborator (THF, 236): 50% / 25% of the party member's enmity moves to the thief
+function hate.special(ja, who, target)
+    if ja == 272 then
+        local m = hate.mobs[target];
+        local e = m and m.list[who.key];
+        if e then e.ce, e.ve = 1, 0; end
+    elseif ja == 67 then
+        local m = hate.mobs[target];
+        local e = m and m.list[who.key];
+        if e then
+            local k = (who.job == 14) and 0.5 or 0.3;
+            e.ce, e.ve = e.ce * (1 - k), e.ve * (1 - k);
+        end
+    elseif ja == 68 then
+        for _, m in pairs(hate.mobs) do
+            local e = m.list[who.key];
+            if e then e.ce, e.ve = 1, 0; end
+        end
+    elseif ja == 84 or ja == 236 then
+        local k = (ja == 84) and 0.5 or 0.25;
+        for _, m in pairs(hate.mobs) do
+            local e = m.list[target];
+            if e and target ~= who.key then
+                local ce, ve = e.ce * k, e.ve * k;
+                e.ce, e.ve = e.ce - ce, e.ve - ve;
+                hate.add(m, who, ce, ve);
+            end
+        end
+    end
+end
+
+-- Jumps arrive as weaponskill-type actions (category 3) carrying the job ability's id and a job ability message
+local JUMP_MSG = { [0] = true, [110] = true, [158] = true, [324] = true };
+
 local function parse_action(e)
     local raw, pos = e.data_raw or e.data, 40;
     local max = (tonumber(e.size) or (type(e.data) == 'string' and #e.data) or 0) * 8;
@@ -471,9 +509,13 @@ local function parse_action(e)
         elseif cat == 6 or cat == 14 or cat == 15 then fixed = hate.data.abilities[param]; end
     end
 
+    local first_target, special = nil, nil;
+    if src and not src.pet and (cat == 6 or cat == 14 or cat == 15) then special = param; end
+
     for _ = 1, targets do
         local target = bits(32);
         local count = bits(4);
+        first_target = first_target or target;
         for _ = 1, count do
             bits(5); bits(11); bits(5); bits(6);              -- reaction, animation, effect, stagger
             local p = bits(17);
@@ -482,6 +524,10 @@ local function parse_action(e)
             local ae_p, ae_m, sp_p, sp_m = 0, 0, 0, 0;
             if bits(1) == 1 then bits(6); bits(4); ae_p = bits(17); ae_m = bits(10); end
             if bits(1) == 1 then bits(6); bits(4); sp_p = bits(14); sp_m = bits(10); end
+            if cat == 3 and src and not src.pet and JUMP_MSG[m] then
+                -- a Jump / High Jump / Super Jump, not a weaponskill: file it under Ability with its real name
+                base, abil, special = 'Ability', ability_name(6, param), param;
+            end
             if src and base and is_mob(target, map) then
                 local kind = HIT[m];
                 if kind then record(src.who, base, p, kind, abil);
@@ -507,6 +553,9 @@ local function parse_action(e)
             end
         end
     end
+
+    -- After the action's own damage / fixed enmity: Enmity Douse, High / Super Jump, Accomplice, Collaborator
+    if special and first_target then hate.special(special, src.who, first_target); end
 end
 
 ----------------------------------------------------------------------------------------------------
