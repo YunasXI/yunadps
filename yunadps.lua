@@ -1,6 +1,6 @@
 addon.name    = 'yunadps';
 addon.author  = 'Yunas';
-addon.version = '1.0.3';
+addon.version = '1.0.4';
 addon.desc    = 'YunaDPS: damage meter for CatsEyeXI in the YunaGearOpt look. Minimizes to the YGO logo.';
 addon.link    = '';
 
@@ -99,9 +99,9 @@ local function push_theme()
         { ImGuiCol_Separator, C.line },
         { ImGuiCol_ScrollbarBg, { 0, 0, 0, 0 } }, { ImGuiCol_ScrollbarGrab, { 1, 1, 1, 0.08 } },
         { ImGuiCol_ScrollbarGrabHovered, { 1, 1, 1, 0.16 } }, { ImGuiCol_ScrollbarGrabActive, { 1, 1, 1, 0.22 } },
-        { ImGuiCol_ResizeGrip, { 1, 1, 1, 0.06 } },
-        { ImGuiCol_ResizeGripHovered, { C.gold[1], C.gold[2], C.gold[3], 0.55 } },
-        { ImGuiCol_ResizeGripActive, { C.gold[1], C.gold[2], C.gold[3], 0.85 } },
+        { ImGuiCol_ResizeGrip, { 0.55, 0.78, 1.00, 0.60 } },          -- light blue, easy to find
+        { ImGuiCol_ResizeGripHovered, { 0.65, 0.85, 1.00, 0.90 } },
+        { ImGuiCol_ResizeGripActive, { 0.75, 0.90, 1.00, 1.00 } },
     };
     for _, c in ipairs(cols) do imgui.PushStyleColor(c[1], c[2]); end
     local vars = {
@@ -171,24 +171,19 @@ local function now() return os.clock(); end
 ----------------------------------------------------------------------------------------------------
 -- Settings & state
 ----------------------------------------------------------------------------------------------------
-local defaults = T{ visible = true, minimized = false, mode = 1, x = 120, y = 220, w = 404, h = 300, idle = 20, size = 100, last_dps = 1,
-                    hate = false, hx = 540, hy = 220, hsize = 100, hh = 220, hattach = true, hmin = false };   -- the Enmity window
+local defaults = T{ visible = true, minimized = false, mode = 1, x = 120, y = 220, w = 404, h = 300, idle = 20, size = 100, last_dps = 1 };
 local s = settings.load(defaults);
-if s.mode == 3 then s.mode = 1; end   -- Enmity used to be a view of the meter; it's its own window now
 
 local ui = { open = { s.visible ~= false }, expanded = {}, place = true, font = nil,
              dbg = { seen = 0, errs = 0, last = nil, lines = 0, party = 0 } };   -- /dps debug counters
 
--- Open or close the Enmity window. It opens at the DPS meter's current size, right next to it.
+-- The Enmity tab of the meter: a click opens it, a second click goes back to the DPS view you had
 function ui.toggle_hate()
-    s.hate = not s.hate;
-    if s.hate then
-        s.hmin = false;
-        s.hsize, s.hh = s.size or 100, s.h or 300;
-        s.hx, s.hy = (s.x or 0) + math.floor(ui.ww or 404) + 8, s.y or 0;
-        ui.k_hate = nil;                                      -- re-placed at that size next frame
+    if s.mode == 3 then
+        s.mode = tonumber(s.last_dps) or 1;
+    else
+        s.last_dps, s.mode = s.mode, 3;
     end
-    ui.hplace = true;
     settings.save();
 end
 
@@ -346,8 +341,9 @@ end
 -- Not known here: other players' enmity gear (taken as none), the monster's level (your level is used).
 -- Who the monster is attacking right now is real, though: it comes from its own attack messages.
 ----------------------------------------------------------------------------------------------------
+local lg = { f = nil, path = nil, t0 = 0, snap_t = 0, n = 0 };   -- the enmity log (/dps log), below
 local hate = { mobs = {}, data = nil, CAP = 30000, last_tick = nil,
-               CURE_MSG = { [7] = true, [263] = true } };
+               CURE_MSG = { [7] = true, [263] = true, [367] = true } };   -- 367: HP restored by an area cure (Majesty)
 
 function hate.load()
     hate.data = { spells = {}, abilities = {} };
@@ -372,24 +368,92 @@ function hate.cure_mod(lv)
 end
 
 -- The monster's entry (made on first sight), with its name from the game
+-- The entity index of a server id: the quick guess from the id, else a search (Domain Invasion / Campaign monsters)
+function hate.index_of(id)
+    local ent = AshitaCore:GetMemoryManager():GetEntity();
+    local idx = bit.band(id, 0xFFF);
+    if idx >= 0x900 then idx = idx - 0x100; end
+    if idx < 0x900 and ent:GetServerId(idx) == id then return idx; end
+    for i = 1, 0x8FF do
+        if ent:GetServerId(i) == id then return i; end
+    end
+    return nil;
+end
+
+-- The monster's level and whether it's a notorious monster, from the mobdb addon's data (addons\mobdb\data\<zone>.lua),
+-- read once per zone. Unknown monsters (e.g. CatsEyeXI's own Campaign ones) use your level, as before.
+hate.zone_db = {};
+function hate.mobdb(name)
+    local zone = 0;
+    pcall(function() zone = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0); end);
+    if hate.zone_db[zone] == nil then
+        hate.zone_db[zone] = false;
+        pcall(function()
+            local fn = loadfile(addon.path .. '/../mobdb/data/' .. tostring(zone) .. '.lua');
+            if fn == nil then return; end
+            setfenv(fn, {});
+            local ok, d = pcall(fn);
+            if ok and type(d) == 'table' and type(d.Names) == 'table' then hate.zone_db[zone] = d.Names; end
+        end);
+    end
+    local names = hate.zone_db[zone];
+    local e = names and names[name];
+    if type(e) ~= 'table' then return nil, false; end
+    local lo, hi = tonumber(e.MinLevel), tonumber(e.MaxLevel);
+    local lv = (lo and hi) and math.floor((lo + hi) / 2 + 0.5) or lo or hi;
+    return lv, e.Notorious == true;
+end
+
+function hate.name_mob(m)
+    pcall(function()
+        local idx = hate.index_of(m.id);
+        if idx then
+            local n = AshitaCore:GetMemoryManager():GetEntity():GetName(idx);
+            if n and n ~= '' then m.name, m.idx = n, idx; end
+        end
+    end);
+    if m.name ~= 'Monster' then m.level, m.nm = hate.mobdb(m.name); end
+    m.name_t = now();
+end
+
 function hate.mob(id)
     local m = hate.mobs[id];
     if m == nil then
-        local name = 'Monster';
-        pcall(function()
-            local ent = AshitaCore:GetMemoryManager():GetEntity();
-            local idx = bit.band(id, 0xFFF);
-            if idx >= 0x900 then idx = idx - 0x100; end
-            if ent:GetServerId(idx) == id then name = ent:GetName(idx) or name; end
-        end);
-        m = { id = id, name = name, list = {}, target = nil, target_t = 0, last = now() };
+        m = { id = id, name = 'Monster', list = {}, target = nil, target_t = 0, last = now(), streak = 0 };
         hate.mobs[id] = m;
+        hate.name_mob(m);
+    elseif m.name == 'Monster' and now() - (m.name_t or 0) > 2 then
+        hate.name_mob(m);                                     -- not loaded yet when first seen: try again
     end
     m.last = now();
     return m;
 end
 
+-- Out of range: the server gives no enmity to someone farther than 25 yalms from the monster (28 for a notorious one)
+function hate.in_range(m, who)
+    local ok, far = pcall(function()
+        local ent = AshitaCore:GetMemoryManager():GetEntity();
+        local pm = AshitaCore:GetMemoryManager():GetParty();
+        local midx = m.idx or hate.index_of(m.id);
+        local widx = pm:GetMemberTargetIndex(who.slot or 0);
+        if not midx or not widx or widx == 0 then return false; end
+        m.idx = midx;
+        local dx = ent:GetLocalPositionX(midx) - ent:GetLocalPositionX(widx);
+        local dy = ent:GetLocalPositionY(midx) - ent:GetLocalPositionY(widx);
+        local dz = ent:GetLocalPositionZ(midx) - ent:GetLocalPositionZ(widx);
+        return math.sqrt(dx * dx + dy * dy + dz * dz) > (m.nm and 28 or 25);
+    end);
+    return not (ok and far);
+end
+
+-- Learned from TARGET (see hate.correct): how much each player's enmity really counts, x1 to start
+hate.calib = {};
+
 function hate.add(m, who, ce, ve)
+    if (ce > 0 or ve > 0) and not hate.in_range(m, who) then return; end
+    local c = hate.calib[who.key] or 1;
+    if ce > 0 then ce = ce * c; end
+    if ve > 0 then ve = ve * c; end
     local e = m.list[who.key];
     if e == nil then
         if next(m.list) == nil then ce, ve = ce + 200, ve + 900; end
@@ -414,10 +478,11 @@ function hate.bonus(who)
 end
 
 function hate.damage(id, who, dmg, mult)
-    local d = hate.dmg_mod(hate.level());
+    local m = hate.mob(id);
+    local d = hate.dmg_mod(m.level or hate.level());          -- the monster's level when mobdb knows it
     dmg = math.max(1, dmg);
     mult = mult or 1;
-    hate.add(hate.mob(id), who, 80 / d * dmg * mult, 240 / d * dmg * mult);
+    hate.add(m, who, 80 / d * dmg * mult, 240 / d * dmg * mult);
 end
 
 -- Buffs, cures and self-target abilities: every monster that already hates the caster or the one helped
@@ -433,10 +498,64 @@ function hate.cure(who, target_key, hp)
     hate.on_lists(who, 40 / c * hp * b, 240 / c * hp * b, target_key);
 end
 
--- The monster hit a party member: that's who it's attacking, and they lose some CE
-function hate.hit_taken(id, victim, dmg)
+-- Self-correction. A monster's normal attacks go to whoever really has the most enmity. When it attacks the same
+-- player twice in a row and the estimate has someone else above them, the estimate is wrong: that player is lifted to
+-- the top, everyone wrongly above is brought just below, and the meter learns from it (their enmity counts x1.05 more,
+-- the others' x0.95 less, from then on, kept for the session). TP moves don't count: some hit random players.
+function hate.correct(m, victim)
+    if m.streak_key == victim.key then m.streak = (m.streak or 0) + 1; else m.streak_key, m.streak = victim.key, 1; end
+    if m.streak < 2 then return; end
+    local e = m.list[victim.key];
+    if e == nil then
+        e = { who = victim, ce = 0, ve = 0 };
+        m.list[victim.key] = e;
+    end
+    local mine = e.ce + e.ve;
+    local wrong = false;
+    for key, o in pairs(m.list) do
+        if key ~= victim.key and o.ce + o.ve > mine * 1.02 and o.ce + o.ve - mine > 24 then
+            wrong = true;
+            -- learn "counts less" only for someone who isn't holding another monster right now: with two tanks,
+            -- the one tanking elsewhere isn't over-estimated, they just aren't this monster's target
+            local tanking = false;
+            for _, m2 in pairs(hate.mobs) do
+                if m2 ~= m and m2.target == key and now() - (m2.target_t or 0) < 12 then tanking = true; end
+            end
+            if not tanking then hate.calib[key] = math.max(0.3, (hate.calib[key] or 1) * 0.95); end
+        end
+    end
+    if not wrong then return; end
+    if lg.f then lg.snapshot(m, 'WRONG (monster keeps hitting ' .. tostring(victim.name) .. '), before the fix'); end
+    hate.calib[victim.key] = math.min(3.0, (hate.calib[victim.key] or 1) * 1.05);
+    -- lift the target (CE first: it doesn't fade), then bring anyone still above just under it
+    local top = 0;
+    for key, o in pairs(m.list) do if key ~= victim.key then top = math.max(top, o.ce + o.ve); end end
+    local need = top * 1.01 - mine;
+    if need > 0 then
+        local add = math.min(need, hate.CAP - e.ce);
+        e.ce = e.ce + add;
+        e.ve = math.min(hate.CAP, e.ve + (need - add));
+    end
+    mine = e.ce + e.ve;
+    for key, o in pairs(m.list) do
+        local tot = o.ce + o.ve;
+        if key ~= victim.key and tot >= mine then
+            local k = (mine * 0.98) / tot;
+            o.ce, o.ve = o.ce * k, o.ve * k;
+        end
+    end
+    if lg.f then lg.snapshot(m, 'after the fix'); end
+end
+
+-- The monster hit a party member: that's who it's attacking, and they lose some CE.
+-- melee = a normal attack (category 1), used for the self-correction.
+function hate.hit_taken(id, victim, dmg, melee)
     local m = hate.mob(id);
+    local switched = m.target ~= victim.key;
+    if switched and lg.f then lg.snapshot(m, 'before target -> ' .. tostring(victim.name)); end
     m.target, m.target_t = victim.key, now();
+    if melee then hate.correct(m, victim); end
+    if switched and lg.f then lg.snapshot(m, 'after'); end
     if dmg <= 0 then return; end
     local maxhp = 0;
     pcall(function()
@@ -454,6 +573,19 @@ function hate.tick()
     local t = now();
     local dt = hate.last_tick and (t - hate.last_tick) or 0;
     hate.last_tick = t;
+    -- a party member who is KO'd loses all their enmity (the server wipes it), checked twice a second
+    if t - (hate.dead_check or 0) > 0.5 then
+        hate.dead_check = t;
+        pcall(function()
+            local pm = AshitaCore:GetMemoryManager():GetParty();
+            for i = 0, 17 do
+                if pm:GetMemberIsActive(i) == 1 and pm:GetMemberHPPercent(i) == 0 and pm:GetMemberHP(i) == 0 then
+                    local sid = pm:GetMemberServerId(i);
+                    if sid and sid ~= 0 then for _, m in pairs(hate.mobs) do m.list[sid] = nil; end end
+                end
+            end
+        end);
+    end
     for id, m in pairs(hate.mobs) do
         if t - m.last > 90 then
             hate.mobs[id] = nil;
@@ -487,7 +619,12 @@ function hate.rows(m)
         table.insert(out, { who = e.who, name = e.who.name, job = e.who.job, me = e.who.me, ce = e.ce, ve = e.ve,
                             total = e.ce + e.ve, target = key == tgt });
     end
-    table.sort(out, function(a, b) return a.total > b.total; end);
+    -- Ties go to the monster's current target, like the server (GetHighestEnmity): at the cap (30000 CE + 30000 VE)
+    -- the tank and the nukers are all equal, and the tank keeps it. "Equal" = within one VE fade step (24).
+    table.sort(out, function(a, b)
+        if math.abs(a.total - b.total) <= 24 and a.target ~= b.target then return a.target; end
+        return a.total > b.total;
+    end);
     return out;
 end
 
@@ -529,6 +666,88 @@ end
 -- Jumps arrive as weaponskill-type actions (category 3) carrying the job ability's id and a job ability message
 local JUMP_MSG = { [0] = true, [110] = true, [158] = true, [324] = true };
 
+----------------------------------------------------------------------------------------------------
+-- Enmity log (/dps log): a text file a tester can send so the enmity estimate can be checked against what really
+-- happened. It holds the party (jobs, levels), every action on a monster, cures / buffs on the party, what the
+-- monster does (who it hits), a snapshot of the estimate whenever the monster changes target (and every 10 s while
+-- fighting), KOs and kills. Written to addons\yunadps\logs\enmity_<date>_<time>.txt
+----------------------------------------------------------------------------------------------------
+
+function lg.w(text)
+    if lg.f == nil then return; end
+    lg.f:write(string.format('%8.2f  %s\n', now() - lg.t0, text));
+    lg.n = lg.n + 1;
+    if lg.n % 20 == 0 then lg.f:flush(); end
+end
+
+local function hex(id) return string.format('%08X', id or 0); end
+
+-- Name of a server id: party member (with job), a known monster, else the id
+function lg.name(id, map)
+    local e = map and map[id];
+    if e then
+        local j = JOBS[e.who.job or 0] or '?';
+        return e.pet and (e.who.name .. "'s pet") or (e.who.name .. '(' .. j .. ')');
+    end
+    local m = hate.mobs[id];
+    if m then return m.name .. '[' .. hex(id) .. ']'; end
+    return hex(id);
+end
+
+-- The estimate on one monster: top 5 with CE / VE and what the meter learned
+function lg.snapshot(m, why)
+    if lg.f == nil or m == nil then return; end
+    local parts = {};
+    for i, r in ipairs(hate.rows(m)) do
+        if i > 5 then break; end
+        local c = hate.calib[r.who and r.who.key or 0] or 1;
+        table.insert(parts, string.format('%d.%s %d(CE %d VE %d%s)%s', i, r.name, math.floor(r.total), math.floor(r.ce),
+            math.floor(r.ve), math.abs(c - 1) > 0.01 and string.format(' x%.2f', c) or '', r.target and ' TARGET' or ''));
+    end
+    lg.w(string.format('ESTIMATE %s on %s[%s] lv %s: %s', why, m.name, hex(m.id), tostring(m.level or '?'), table.concat(parts, ', ')));
+end
+
+function lg.start()
+    local install = addon.path .. '/logs/';
+    pcall(function() if ashita.fs and ashita.fs.create_directory then ashita.fs.create_directory(install); end end);
+    local f = io.open(install .. '.probe', 'w');
+    if f then f:close(); os.remove(install .. '.probe'); else pcall(os.execute, 'mkdir "' .. install:gsub('/', '\\'):gsub('\\$', '') .. '"'); end
+    lg.path = install .. os.date('enmity_%Y%m%d_%H%M%S.txt');
+    lg.f = io.open(lg.path, 'w');
+    if lg.f == nil then lg.path = addon.path .. '/' .. os.date('enmity_%Y%m%d_%H%M%S.txt'); lg.f = io.open(lg.path, 'w'); end
+    if lg.f == nil then return false; end
+    lg.t0, lg.n = now(), 0;
+    lg.f:write(string.format('YunaDPS %s enmity log, %s\n', tostring(addon.version), os.date('%Y-%m-%d %H:%M:%S')));
+    pcall(function()
+        local pm = AshitaCore:GetMemoryManager():GetParty();
+        lg.f:write(string.format('zone %s, your level %s\nparty / alliance:\n', tostring(pm:GetMemberZone(0)), tostring(hate.level())));
+        for i = 0, 17 do
+            if pm:GetMemberIsActive(i) == 1 and pm:GetMemberServerId(i) ~= 0 then
+                lg.f:write(string.format('  %s  %s%s/%s%s  %s\n', pm:GetMemberName(i), JOBS[pm:GetMemberMainJob(i)] or '?',
+                    tostring(pm:GetMemberMainJobLevel(i)), JOBS[pm:GetMemberSubJob(i)] or '?', tostring(pm:GetMemberSubJobLevel(i)),
+                    hex(pm:GetMemberServerId(i))));
+            end
+        end
+    end);
+    lg.f:write('columns: seconds  what\n');
+    lg.f:flush();
+    return true;
+end
+
+function lg.stop()
+    if lg.f then lg.w('log stopped'); lg.f:close(); end
+    lg.f = nil;
+end
+
+-- One action line: who, category / id / name, on whom, message, number, extra effect
+function lg.action(actor, cat, param, abil, target, m, p, ae_m, ae_p, map)
+    local what = ({ [1] = 'melee', [2] = 'ranged', [3] = 'WS', [4] = 'spell', [6] = 'ability', [11] = 'mob TP move',
+                    [13] = 'pet ability', [14] = 'ability', [15] = 'ability' })[cat] or ('cat ' .. cat);
+    lg.w(string.format('%s %s %s%s -> %s  msg %d  %d%s', lg.name(actor, map), what, tostring(param),
+        abil and (' ' .. abil) or '', lg.name(target, map), m, p, (ae_m and ae_m > 0) and string.format('  +effect msg %d %d', ae_m, ae_p) or ''));
+end
+
+
 local function parse_action(e)
     local raw, pos = e.data_raw or e.data, 40;
     local max = (tonumber(e.size) or (type(e.data) == 'string' and #e.data) or 0) * 8;
@@ -557,7 +776,7 @@ local function parse_action(e)
         elseif cat == 6 or cat == 14 or cat == 15 then fixed = hate.data.abilities[param]; end
     end
 
-    local first_target, special = nil, nil;
+    local first_target, special, ja3_seen = nil, nil, false;
     if src and not src.pet and (cat == 6 or cat == 14 or cat == 15) then special = param; end
 
     for _ = 1, targets do
@@ -575,6 +794,8 @@ local function parse_action(e)
             if cat == 3 and src and not src.pet and JUMP_MSG[m] then
                 -- a Jump / High Jump / Super Jump, not a weaponskill: file it under Ability with its real name
                 base, abil, special = 'Ability', ability_name(6, param), param;
+                -- its fixed enmity too (Shield Bash 450 / 900, Weapon Bash...), once per action
+                if not ja3_seen then ja3_seen = true; fixed = hate.data and hate.data.abilities[param] or nil; end
             end
             if src and base and is_mob(target, map) then
                 local kind = HIT[m];
@@ -601,7 +822,11 @@ local function parse_action(e)
                     if fixed then local b = hate.bonus(src.who); hate.on_lists(src.who, fixed[1] * b, fixed[2] * b, target); fixed = nil; end
                 end
             elseif src == nil and is_mob(actor, map) and map[target] and not map[target].pet and (cat == 1 or cat == 11) then
-                hate.hit_taken(actor, map[target].who, HIT[m] and p or 0);
+                hate.hit_taken(actor, map[target].who, HIT[m] and p or 0, cat == 1);
+            end
+
+            if lg.f and (src or (is_mob(actor, map) and map[target])) and cat ~= 7 and cat ~= 8 and cat ~= 9 and cat ~= 12 then
+                lg.action(actor, cat, param, abil, target, m, p, ae_m, ae_p, map);
             end
         end
     end
@@ -858,7 +1083,10 @@ local function draw_header()
     -- The DPS menu (Current / Total, Reset), then the Enmity window button, then _ and X
     imgui.SetCursorPos({ ww - Z(72) - Z(80) - Z(126), oy + Z(13) });
     imgui.PushItemWidth(Z(120));
-    local opened = imgui.BeginCombo('##ym_view', s.mode == 2 and 'Total DPS' or 'Current DPS');
+    local dps_mode = (s.mode == 3) and (tonumber(s.last_dps) or 1) or s.mode;
+    if s.mode == 3 then imgui.PushStyleColor(ImGuiCol_Text, C.muted); end   -- dimmed while the Enmity tab is open
+    local opened = imgui.BeginCombo('##ym_view', dps_mode == 2 and 'Total DPS' or 'Current DPS');
+    if s.mode == 3 then imgui.PopStyleColor(); end
     if opened then
         imgui.SetWindowFontScale(1.0);
         if imgui.Selectable('Current DPS', s.mode == 1) then s.mode = 1; settings.save(); end
@@ -878,8 +1106,8 @@ local function draw_header()
         end
     end
 
-    -- Enmity: opens / closes the separate Enmity window (lit while it's open)
-    local on = s.hate == true;
+    -- ENMITY tab: lit while open; a second click goes back to the DPS view you had
+    local on = s.mode == 3;
     imgui.SetCursorPos({ ww - Z(72) - Z(78), oy + Z(13) });
     imgui.PushStyleColor(ImGuiCol_Button, on and { 0.85, 0.20, 0.22, 0.55 } or { 0.85, 0.20, 0.22, 0.12 });
     imgui.PushStyleColor(ImGuiCol_ButtonHovered, on and { 0.85, 0.20, 0.22, 0.70 } or { 0.85, 0.20, 0.22, 0.25 });
@@ -890,7 +1118,7 @@ local function draw_header()
     end
     imgui.PopStyleColor(4);
     if imgui.IsItemHovered() then
-        imgui.SetTooltip((on and 'Close' or 'Open') .. ' the Enmity window: estimated enmity on your target and who the\nmonster is attacking right now. Drag it anywhere, next to this meter.');
+        imgui.SetTooltip('Estimated enmity on your target (or the last monster fought).\nShows who the monster is attacking right now.');
     end
 
     imgui.SetCursorPos({ ww - Z(72), oy + Z(13) });
@@ -982,7 +1210,9 @@ local function draw_enmity_rows()
         local x, y = imgui.GetCursorScreenPos();
         imgui.InvisibleButton('##ym_hate' .. i, { W, h });
         if imgui.IsItemHovered() then
-            imgui.SetTooltip(string.format('CE %s (drops when hit)\nVE %s (fades over time)', fmt(a.ce), fmt(a.ve)));
+            local c = hate.calib[a.who and a.who.key or 0] or 1;
+            imgui.SetTooltip(string.format('CE %s (drops when hit)\nVE %s (fades over time)%s', fmt(a.ce), fmt(a.ve),
+                math.abs(c - 1) > 0.01 and string.format('\nLearned from TARGET: their enmity counts x%.2f', c) or ''));
         end
         dl:AddRectFilled({ x, y }, { x + W, y + h }, u32(C.card), Z(5));
         local jc = JOB_COL[a.job or 0] or C.gold;
@@ -1021,6 +1251,7 @@ local function draw_enmity_rows()
 end
 
 local function draw_rows()
+    if s.mode == 3 then draw_enmity_rows(); return; end
     local seg = segment();
     local list = roster_rows(seg);
     if #list == 0 then
@@ -1128,7 +1359,7 @@ local function draw_mini_win(o)
         if type(wx) == 'table' then wx, wy = wx.x or wx[1], wx.y or wx[2]; end
         if type(wx) == 'number' and type(wy) == 'number' then wx, wy = math.floor(wx), math.floor(wy); o.moved(wx, wy); end
         imgui.SetWindowFontScale(1.0);
-        local S, LW = Z(64), Z(150);                          -- logo size, width of the top-3 list under it
+        local S, LW = Z(64), o.width or Z(150);               -- logo size, width of the list under it
         local cx = imgui.GetCursorPosX();
         imgui.SetCursorPosX(cx + (LW - S) / 2);
         ui[o.hov] = draw_logo(S, ui[o.hov], fighting());
@@ -1142,9 +1373,19 @@ local function draw_mini_win(o)
         imgui.SetCursorPosX(cx);
         local x, y = imgui.GetCursorScreenPos();
         y = y + Z(3);
-        local rows = math.max(1, math.min(3, #list));
-        dl:AddRectFilled({ x, y }, { x + LW, y + rows * lh + Z(8) }, u32({ C.bg[1], C.bg[2], C.bg[3], 0.88 }), Z(6));
-        dl:AddRect({ x, y }, { x + LW, y + rows * lh + Z(8) }, u32({ C.gold[1], C.gold[2], C.gold[3], 0.35 }), Z(6));
+        local n = o.rows or 3;
+        local rows = math.max(1, math.min(n, #list));
+        local hdr = (o.cols and #list > 0) and 1 or 0;        -- enmity: a small ENMITY / CE / VE title line
+        local box = (rows + hdr) * lh + Z(8);
+        dl:AddRectFilled({ x, y }, { x + LW, y + box }, u32({ C.bg[1], C.bg[2], C.bg[3], 0.88 }), Z(6));
+        dl:AddRect({ x, y }, { x + LW, y + box }, u32({ C.gold[1], C.gold[2], C.gold[3], 0.35 }), Z(6));
+        -- enmity columns end at: total, CE, VE (from the right)
+        local c_ve, c_ce, c_tot = x + LW - Z(7), x + LW - Z(57), x + LW - Z(107);
+        local function short(v)
+            v = math.floor((v or 0) + 0.5);
+            if v >= 1000 then return string.format('%.1fk', v / 1000); end
+            return tostring(v);
+        end
         local function outlined(px, py, col, text)
             for _, d in ipairs({ { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }) do
                 put_text(px + d[1], py + d[2], { 0, 0, 0, 0.9 }, text);
@@ -1152,18 +1393,34 @@ local function draw_mini_win(o)
             put_text(px, py, col, text);
         end
         if #list == 0 then outlined(x + (LW - text_w(o.empty)) / 2, y + Z(4), C.muted, o.empty); end
-        for i = 1, math.min(3, #list) do
-            local a, py = list[i], y + Z(4) + (i - 1) * lh;
+        if hdr == 1 then
+            imgui.SetWindowFontScale(0.78);
+            local hy = y + Z(5);
+            put_text(c_tot - text_w('ENMITY'), hy, C.muted, 'ENMITY');
+            put_text(c_ce - text_w('CE'), hy, C.muted, 'CE');
+            put_text(c_ve - text_w('VE'), hy, C.muted, 'VE');
+            imgui.SetWindowFontScale(0.95);
+        end
+        for i = 1, math.min(n, #list) do
+            local a, py = list[i], y + Z(4) + (i - 1 + hdr) * lh;
             local name = tostring(a.name or '?');
-            if #name > 11 then name = name:sub(1, 10) .. '.'; end
+            local maxn = o.cols and 10 or 11;
+            if #name > maxn then name = name:sub(1, maxn - 1) .. '.'; end
             local num = fmt(a.total);
             local col = a.me and { 0.76, 0.82, 1.0, 1 } or { 1, 1, 1, 1 };  -- you in light periwinkle
             if a.target then col = { 1.0, 0.45, 0.42, 1 }; end            -- enmity: who the monster is attacking
-            outlined(x + Z(7), py, C.gold, i .. '.');
+            outlined(x + Z(7), py, C.gold, (a.rank or i) .. '.');
             outlined(x + Z(7) + text_w('0. '), py, col, name);
-            outlined(x + LW - Z(7) - text_w(num), py, col, num);
+            if o.cols then                                    -- enmity: total, CE, VE
+                local tot, ce, ve = short(a.total), short(a.ce), short(a.ve);
+                outlined(c_tot - text_w(tot), py, col, tot);
+                outlined(c_ce - text_w(ce), py, { 0.80, 0.84, 0.95, 1 }, ce);
+                outlined(c_ve - text_w(ve), py, { 0.80, 0.84, 0.95, 1 }, ve);
+            else
+                outlined(x + LW - Z(7) - text_w(num), py, col, num);
+            end
         end
-        imgui.Dummy({ LW, rows * lh + Z(11) });
+        imgui.Dummy({ LW, box + Z(3) });
         imgui.SetWindowFontScale(1.0);
         if ui[o.hov] then imgui.SetTooltip(o.tip); end
 
@@ -1180,24 +1437,34 @@ local function draw_mini_win(o)
     imgui.PopStyleVar(2);
 end
 
--- The meter minimized: logo + top 3 by damage
+-- The top 5 by enmity for the minimized view. Whoever the monster is attacking (TARGET) is always in it: when
+-- they're not in the top 5 by the estimate, they take the 5th line (with their real place in the list).
+local function hate_top5()
+    local all = hate.rows(hate.focus());
+    local out = {};
+    for i, a in ipairs(all) do a.rank = i; end
+    for i = 1, math.min(5, #all) do out[i] = all[i]; end
+    local shown = false;
+    for _, a in ipairs(out) do if a.target then shown = true; end end
+    if not shown then
+        for _, a in ipairs(all) do
+            if a.target then out[5] = a; break; end
+        end
+    end
+    return out;
+end
+
+-- The meter minimized: logo + top 3 by damage, or on the Enmity tab the top 5 by enmity (with TARGET)
 local function draw_mini()
-    draw_mini_win({ id = 'YunaDPS##ym_mini', x = s.x, y = s.y, place = ui.place, list = sorted_actors(segment()),
-        empty = 'YunaDPS', hov = 'mini_hov',
+    local enm = s.mode == 3;
+    draw_mini_win({ id = 'YunaDPS##ym_mini', x = s.x, y = s.y, place = ui.place,
+        list = enm and hate_top5() or sorted_actors(segment()), rows = enm and 5 or 3,
+        cols = enm, width = enm and Z(250) or nil,
+        empty = enm and 'Enmity' or 'YunaDPS', hov = 'mini_hov',
         tip = string.format('YunaDPS - %s DPS\nClick to open, drag to move', fmt(my_dps())),
         moved = function(x, y) s.x, s.y = x, y; end,
         restore = function() s.minimized, ui.place = false, true; settings.save(); end });
     ui.place = false;
-end
-
--- The Enmity window minimized: logo + top 3 by enmity, the one being attacked in red
-local function draw_hate_mini()
-    draw_mini_win({ id = 'YunaDPS Enmity##ym_hatemini', x = s.hx, y = s.hy, place = ui.hplace, list = hate.rows(hate.focus()),
-        empty = 'Enmity', hov = 'hmini_hov',
-        tip = 'Enmity - click to open, drag to move',
-        moved = function(x, y) s.hx, s.hy = x, y; end,
-        restore = function() s.hmin, ui.hplace = false, true; settings.save(); end });
-    ui.hplace = false;
 end
 
 -- The size everything is drawn at: s.size, which follows the meter's width. Not taken from the screen:
@@ -1207,102 +1474,6 @@ local function update_scale()
     local k = math.max(0.5, math.min(2.5, (tonumber(s.size) or 100) / 100));
     if math.abs(k - (ui.k_main or 0)) > 0.011 then ui.k_main, ui.place = k, true; end   -- e.g. a size changed in the settings file
     scale.k = ui.k_main;
-end
-
--- The Enmity window: its own place and size, next to the meter or anywhere. Like the meter, its width sets the size
--- of everything in it (saved as s.hsize; the height, s.hh, decides how many rows show).
-local HATE_W = BASE_W;   -- same base width as the meter, so the same size reads the same
-
--- The attach / detach icon: two small cards, joined when attached, apart when detached. Returns true when clicked.
-local function attach_icon(attached)
-    local x, y = imgui.GetCursorScreenPos();
-    local w, h = Z(28), Z(24);
-    local clicked = imgui.InvisibleButton('##ym_attach', { w, h });
-    local hov = imgui.IsItemHovered();
-    local dl = imgui.GetWindowDrawList();
-    if hov then dl:AddRectFilled({ x, y }, { x + w, y + h }, u32({ 1, 1, 1, 0.08 }), Z(5)); end
-    local col = u32(hov and C.text or C.muted);
-    local cy, bw, bh = y + h / 2, Z(8), Z(11);
-    if attached then                                          -- two cards side by side, touching, with a link bar
-        dl:AddRect({ x + Z(5), cy - bh / 2 }, { x + Z(5) + bw, cy + bh / 2 }, col, Z(2), 0, Z(1.4));
-        dl:AddRect({ x + Z(15), cy - bh / 2 }, { x + Z(15) + bw, cy + bh / 2 }, col, Z(2), 0, Z(1.4));
-        dl:AddLine({ x + Z(11), cy }, { x + Z(17), cy }, col, Z(2));
-    else                                                      -- the same two cards pulled apart
-        dl:AddRect({ x + Z(3), cy - bh / 2 }, { x + Z(3) + bw, cy + bh / 2 }, col, Z(2), 0, Z(1.4));
-        dl:AddRect({ x + Z(17), cy - bh / 2 + Z(2) }, { x + Z(17) + bw, cy + bh / 2 + Z(2) }, col, Z(2), 0, Z(1.4));
-    end
-    if hov then
-        imgui.SetTooltip(attached and 'Attached to the DPS meter: it moves and sizes with it.\nClick to detach it (then move and resize it on its own).'
-            or 'Detached: move and resize it on its own.\nClick to attach it to the right of the DPS meter.');
-    end
-    return clicked;
-end
-
--- attached: stuck to the right side of the DPS meter, at its size (it can't be moved or resized by itself)
-local function draw_hate_window(attached)
-    local open = { true };
-    local flags = bit.bor(ImGuiWindowFlags_NoTitleBar, ImGuiWindowFlags_NoCollapse, ImGuiWindowFlags_NoScrollbar,
-        ImGuiWindowFlags_NoScrollWithMouse);
-    if attached then
-        imgui.SetNextWindowPos({ s.x + ui.ww + Z(6), s.y }, ImGuiCond_Always);
-        imgui.SetNextWindowSize({ ui.ww, ui.wh or Z(300) }, ImGuiCond_Always);
-        flags = bit.bor(flags, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoResize);
-        ui.hplace = false;
-    else
-        if ui.hplace then
-            imgui.SetNextWindowPos({ s.hx, s.hy }, ImGuiCond_Always);
-            imgui.SetNextWindowSize({ Z(HATE_W), Z(s.hh or 220) }, ImGuiCond_Always);
-            ui.hplace = false;
-        end
-        imgui.SetNextWindowSizeConstraints({ HATE_W * 0.5, Z(90) }, { HATE_W * 2.5, 4000 });
-    end
-    if imgui.Begin('YunaDPS Enmity##ym_hatewin', open, flags) then
-        local x, y = imgui.GetWindowPos();
-        if type(x) == 'table' then x, y = x.x or x[1], x.y or x[2]; end
-        if type(x) == 'number' and type(y) == 'number' then s.hx, s.hy = math.floor(x), math.floor(y); end
-        local ww, wh = imgui.GetWindowSize();
-        if type(ww) == 'table' then ww, wh = ww.x or ww[1], ww.y or ww[2]; end
-        if type(ww) == 'number' and type(wh) == 'number' and not attached then
-            local k = math.max(0.5, math.min(2.5, ww / HATE_W));
-            if math.abs(k - scale.k) > 0.005 then scale.k, ui.k_hate, s.hsize = k, k, math.floor(k * 100 + 0.5); end
-            s.hh = math.floor(wh / scale.k);
-        end
-        ww = ww or Z(HATE_W);
-        imgui.SetWindowFontScale(1.0);
-        -- header: the logo (click = minimize) and ENMITY on the left; attach / detach, _ and X on the right
-        local ox, oy = imgui.GetCursorPos();
-        local LS = Z(34);
-        ui.hlogo_hov = draw_logo(LS, ui.hlogo_hov, fighting());
-        if ui.hlogo_hov then imgui.SetTooltip('Click to shrink the Enmity window to this logo'); end
-        if ui.hlogo_hov and imgui.IsMouseClicked(0) then s.hmin, ui.hplace = true, true; settings.save(); end
-        imgui.SetCursorPos({ ox + LS + Z(8), oy + (LS - imgui.GetTextLineHeight()) / 2 });
-        imgui.TextColored({ 1.0, 0.45, 0.42, 1 }, 'ENMITY');
-        local by = oy + (LS - Z(24)) / 2;
-        imgui.SetCursorPos({ ww - Z(72) - Z(30), by });
-        if attach_icon(attached and true or false) then
-            if s.hattach ~= false then
-                s.hattach, s.hsize, s.hh = false, s.size or 100, s.h or 300;   -- detach where it is, at the meter's size
-                ui.k_hate = nil;
-            else
-                s.hattach = true;
-            end
-            settings.save();
-        end
-        imgui.SetCursorPos({ ww - Z(72), by });
-        if ghost_button('_##ym_hate_min', { Z(28), Z(24) }) then s.hmin, ui.hplace = true, true; settings.save(); end
-        if imgui.IsItemHovered() then imgui.SetTooltip('Shrink to the logo (with the top 3 under it)'); end
-        imgui.SameLine(0, 2);
-        if ghost_button('X##ym_hate_close', { Z(28), Z(24) }) then s.hate = false; settings.save(); end
-        if imgui.IsItemHovered() then imgui.SetTooltip('Close (the Enmity button on the meter opens it again)'); end
-        imgui.SetCursorPos({ ox, oy + LS + Z(4) });
-        if imgui.BeginChild('ym_hate_rows', { 0, 0 }, false) then
-            imgui.SetWindowFontScale(1.0);
-            W = math.max(Z(150), ww - Z(24) - Z(10));
-            draw_enmity_rows();
-        end
-        imgui.EndChild();
-    end
-    imgui.End();
 end
 
 local function draw_ui()
@@ -1317,22 +1488,6 @@ local function draw_ui()
         imgui.PopStyleVar(nv);
         imgui.PopStyleColor(nc);
         if not ui.open[1] then s.visible = false; settings.save(); end
-    end
-    -- The Enmity window, at its own size (stays up while the meter is minimized or hidden)
-    if s.hate then
-        -- attached only while the DPS meter is up at full size; otherwise it stays where it is, on its own
-        local attached = s.hattach ~= false and not s.hmin and ui.open[1] and not s.minimized and ui.ww ~= nil;
-        local k = math.max(0.5, math.min(2.5, (tonumber(s.hsize) or 100) / 100));
-        if math.abs(k - (ui.k_hate or 0)) > 0.011 then ui.k_hate, ui.hplace = k, true; end
-        scale.k = attached and (ui.k_main or 1) or ui.k_hate;
-        local nc, nv = push_theme();
-        fp = push_font();
-        if s.hmin then draw_hate_mini(); else draw_hate_window(attached); end
-        if fp then imgui.PopFont(); end
-        scale.f = 1;
-        imgui.PopStyleVar(nv);
-        imgui.PopStyleColor(nc);
-        scale.k = ui.k_main or 1;
     end
 end
 
@@ -1349,22 +1504,23 @@ local function show_help(loaded)
     for _, line in ipairs({
         '/dps  -  open or close the meter',
         '/dps min  -  shrink it to the logo and back (or click _ / the logo)',
-        '/dps current | total  -  switch view (also the menu)',
-        '/dps enmity  -  open or close the Enmity window (also the Enmity button)',
+        '/dps current | total | enmity  -  switch view (also the menu and the Enmity tab)',
         '/dps reset  -  clear every number',
         '/dps report [p | l | l2 | s | echo]  -  post the top 5 in party, linkshell... (or click the logo)',
         '/dps idle <seconds>  -  how long with no damage before a fight ends (now ' .. tostring(s.idle or 20) .. ')',
+        '/dps log  -  record an enmity log to send Yunas (again to stop and save)',
         '/dps help  -  this list',
     }) do msg(line); end
 end
 
 ashita.events.register('load', 'ym_load', function() load_font(); hate.load(); show_help(true); end);
-ashita.events.register('unload', 'ym_unload', function() settings.save(); end);
+ashita.events.register('unload', 'ym_unload', function() settings.save(); lg.stop(); end);
 
 ashita.events.register('d3d_present', 'ym_present', function()
     local f = meter.fight;
     if f ~= nil and not f.ended and now() - f.last > (s.idle or 20) then f.ended = true; end
     pcall(hate.tick);
+    if lg.f and now() - lg.snap_t > 10 and fighting() then lg.snap_t = now(); pcall(lg.snapshot, hate.focus(), 'every 10s'); end
     send_chat_queue();
     draw_ui();
 end);
@@ -1386,7 +1542,10 @@ ashita.events.register('packet_in', 'ym_packet_in', function(e)
             local d = e.data;
             local function u(at, n) local v = 0; for i = n, 1, -1 do v = v * 256 + (d:byte(at + i) or 0); end return v; end
             local m = u(0x18, 2);
-            if m == 6 or m == 20 or m == 97 or m == 113 or m == 406 or m == 605 or m == 646 then hate.mobs[u(0x08, 4)] = nil; end
+            if m == 6 or m == 20 or m == 97 or m == 113 or m == 406 or m == 605 or m == 646 then
+                if lg.f then lg.w(string.format('DEATH msg %d  %s', m, hex(u(0x08, 4)))); end
+                hate.mobs[u(0x08, 4)] = nil;
+            end
         end);
     end
 end);
@@ -1421,6 +1580,17 @@ ashita.events.register('command', 'ym_command', function(e)
         s.idle = math.max(5, math.min(120, math.floor(tonumber(args[3]))));
         settings.save();
         msg(string.format('A fight now ends after %d seconds with no party damage.', s.idle));
+    elseif sub == 'log' then
+        if lg.f then
+            local path = lg.path;
+            lg.stop();
+            msg('Enmity log saved: ' .. tostring(path));
+            msg('Send that file (it is in addons\\yunadps\\logs) to Yunas.');
+        elseif lg.start() then
+            msg('Enmity log ON. Fight as usual, then type /dps log again to save it.');
+        else
+            msg('Could not create the log file in the addon folder.');
+        end
     elseif sub == 'debug' then
         local d, n = ui.dbg, 0;
         pcall(function() for _ in pairs(party_map()) do n = n + 1; end end);
@@ -1434,7 +1604,10 @@ ashita.events.register('command', 'ym_command', function(e)
             for _, r in ipairs(hate.rows(hm)) do
                 table.insert(parts, string.format('%s %s (CE %s VE %s)%s', r.name, fmt(r.total), fmt(r.ce), fmt(r.ve), r.target and ' TARGET' or ''));
             end
-            msg('enmity on ' .. tostring(hm.name) .. ': ' .. table.concat(parts, ', '));
+            msg('enmity on ' .. tostring(hm.name) .. ' (level ' .. tostring(hm.level or 'unknown') .. '): ' .. table.concat(parts, ', '));
+            local top = {};
+            for _, r in ipairs(hate_top5()) do table.insert(top, r.rank .. '.' .. r.name .. (r.target and ' TARGET' or '')); end
+            msg('minimized top 5: ' .. table.concat(top, ', '));
         else
             msg('enmity: no monster yet');
         end
