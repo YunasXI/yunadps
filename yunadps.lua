@@ -1,6 +1,6 @@
 addon.name    = 'yunadps';
 addon.author  = 'Yunas';
-addon.version = '1.0.4';
+addon.version = '1.0.5';
 addon.desc    = 'YunaDPS: damage meter for CatsEyeXI in the YunaGearOpt look. Minimizes to the YGO logo.';
 addon.link    = '';
 
@@ -929,11 +929,11 @@ end
 function fx.back(dl, x, y, w, h, hov, fighting)
     local t = fx.time();
     local p = 0.5 + 0.5 * math.sin(t * (fighting and 4.0 or 1.4));
-    local col = fighting and { 1.0, 0.30, 0.25 } or { 0.85, 0.20, 0.22 };   -- red, like the logo's ink ring
-    fx.glow(dl, x + 0.50 * w, y + 0.50 * h, w * (0.56 + 0.03 * p), col, (hov and 0.22 or 0.10) + 0.07 * p);   -- a halo just past the disc
+    local col = fighting and { 1.0, 0.30, 0.25 } or { 0.85, 0.20, 0.22 };   -- red, like the blood on the blade
+    fx.glow(dl, x + 0.55 * w, y + 0.50 * h, w * (0.40 + 0.03 * p), col, (hov and 0.14 or 0.05) + 0.05 * p);   -- a soft halo behind the samurai
 end
 
--- In front: a glint down the katana and a spark circling the ink ring
+-- In front: a glint running down the katana (hilt -> tip), and a little star when it reaches the tip
 function fx.front(dl, x, y, w, h, hov)
     local t = fx.time();
     local function at(fx_, fy) return x + fx_ * w, y + fy * h; end
@@ -941,21 +941,14 @@ function fx.front(dl, x, y, w, h, hov)
     local ph = t % period;
     if ph < 0.55 then
         local u = ph / 0.55;
-        local gx, gy = at(0.30 + (0.92 - 0.30) * u, 0.42 + (0.72 - 0.42) * u);
+        local gx, gy = at(0.27 + (0.95 - 0.27) * u, 0.38 + (0.90 - 0.38) * u);
         fx.glow(dl, gx, gy, w * 0.05, { 0.80, 0.88, 1.0 }, 0.55);
         dl:AddCircleFilled({ gx, gy }, w * 0.012, u32({ 1, 1, 1, 0.9 }), 12);
     elseif ph < 0.95 then
         local a = 1 - (ph - 0.55) / 0.4;
-        local tx, ty = at(0.92, 0.72);
+        local tx, ty = at(0.95, 0.90);
         fx.star(dl, tx, ty, 2 + 5 * a, a);
     end
-    local ang = t * 0.8;
-    local cx, cy = at(0.50, 0.50);
-    local sx, sy = cx + math.cos(ang) * w * 0.44, cy + math.sin(ang) * h * 0.44;
-    fx.glow(dl, sx, sy, w * 0.03, { 1.0, 0.35, 0.30 }, 0.45);
-    fx.star(dl, sx, sy, 2 + 1.2 * math.sin(t * 6), 0.8);
-    -- a thin red rim around the disc
-    dl:AddCircle({ cx, cy }, w * 0.478, u32({ 0.90, 0.22, 0.24, hov and 0.80 or 0.45 }), 48, 1.2);
 end
 
 -- Draw the logo at the cursor, with its effects. Returns true while the mouse is on it.
