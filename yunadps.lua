@@ -1,6 +1,6 @@
 addon.name    = 'yunadps';
 addon.author  = 'Yunas';
-addon.version = '1.0.1';
+addon.version = '1.0.2';
 addon.desc    = 'YunaDPS: damage meter for CatsEyeXI in the YunaGearOpt look. Minimizes to the YGO logo.';
 addon.link    = '';
 
@@ -25,7 +25,7 @@ do
     end
 end
 
--- Size: everything is drawn at scale.k = the Size picked in the menu (or /dps size), 1 = Normal.
+-- Size: everything is drawn at scale.k, set by the meter's width (drag its corner), 1 = Normal.
 -- Z(n) is n pixels at that size; window text scales the same way.
 local scale = { k = 1, f = 1 };   -- f: font size correction (see push_font)
 local function Z(n) return n * scale.k; end
@@ -171,11 +171,26 @@ local function now() return os.clock(); end
 ----------------------------------------------------------------------------------------------------
 -- Settings & state
 ----------------------------------------------------------------------------------------------------
-local defaults = T{ visible = true, minimized = false, mode = 1, x = 120, y = 220, w = 404, h = 300, idle = 20, size = 100, last_dps = 1 };
+local defaults = T{ visible = true, minimized = false, mode = 1, x = 120, y = 220, w = 404, h = 300, idle = 20, size = 100, last_dps = 1,
+                    hate = false, hx = 540, hy = 220, hsize = 100, hh = 220, hattach = true, hmin = false };   -- the Enmity window
 local s = settings.load(defaults);
+if s.mode == 3 then s.mode = 1; end   -- Enmity used to be a view of the meter; it's its own window now
 
 local ui = { open = { s.visible ~= false }, expanded = {}, place = true, font = nil,
              dbg = { seen = 0, errs = 0, last = nil, lines = 0, party = 0 } };   -- /dps debug counters
+
+-- Open or close the Enmity window. It opens at the DPS meter's current size, right next to it.
+function ui.toggle_hate()
+    s.hate = not s.hate;
+    if s.hate then
+        s.hmin = false;
+        s.hsize, s.hh = s.size or 100, s.h or 300;
+        s.hx, s.hy = (s.x or 0) + math.floor(ui.ww or 404) + 8, s.y or 0;
+        ui.k_hate = nil;                                      -- re-placed at that size next frame
+    end
+    ui.hplace = true;
+    settings.save();
+end
 
 -- A segment holds everyone's damage: the current fight, or the whole session (total)
 local function new_segment(t) return { start = t, last = t, sum = 0, actors = {}, done = 0 }; end
@@ -192,6 +207,8 @@ local HIT  = { [1] = 'hit', [67] = 'crit', [352] = 'hit', [353] = 'crit', [576] 
                [185] = 'hit', [197] = 'hit', [264] = 'hit', [2] = 'hit', [252] = 'hit', [110] = 'hit', [317] = 'hit',
                [77] = 'hit', [522] = 'hit' };
 local MISS = { [15] = true, [63] = true, [354] = true, [188] = true };
+-- A spell on a monster that didn't land at all ("resists the spell", "completely resists"): counts against magic accuracy
+local MRESIST = { [85] = true, [284] = true, [655] = true, [656] = true };
 local CAT_OF = { [1] = 'Melee', [2] = 'Ranged', [3] = 'Weapon skill', [4] = 'Magic', [6] = 'Ability',
                  [11] = 'Pet', [13] = 'Pet', [14] = 'Ability', [15] = 'Ability' };
 local SC_MSG = { [163] = 'Add. effect', [229] = 'Add. effect' };
@@ -298,6 +315,23 @@ local function record(who, cat, dmg, kind, abil)
     f.last = t;
     add_to(f, who, cat, dmg, kind, abil);
     add_to(meter.total, who, cat, dmg, kind, abil);
+end
+
+-- Magic accuracy: one spell on one monster, landed or fully resisted (into the current fight and the session total)
+local function record_macc(who, landed)
+    local t0 = now();
+    local f = meter.fight;
+    if f == nil or f.ended then
+        if f ~= nil then meter.total.done = meter.total.done + math.max(1, f.last - f.start); end
+        f = new_segment(t0);
+        meter.fight = f;
+    end
+    f.last = t0;
+    for _, seg in ipairs({ f, meter.total }) do
+        local a = actor_of(seg, who);
+        a.macc = a.macc or { land = 0, miss = 0 };
+        if landed then a.macc.land = a.macc.land + 1; else a.macc.miss = a.macc.miss + 1; end
+    end
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -444,7 +478,7 @@ function hate.rows(m)
 end
 
 -- Abilities whose server script moves enmity instead of adding it (LandSandBoat scripts/globals/job_utils):
---   Enmity Douse (BLM, 272): your enmity on that monster -> CE 1, VE 0
+--   Enmity Douse (BLM, 272): your enmity on that monster -30% (CatsEyeXI; standard LandSandBoat sets it to CE 1, VE 0)
 --   High Jump (DRG, 67): your enmity on it -50% (DRG main job) or -30% (DRG sub)
 --   Super Jump (DRG, 68): your enmity on every monster -> CE 1, VE 0
 --   Accomplice (THF, 84) / Collaborator (THF, 236): 50% / 25% of the party member's enmity moves to the thief
@@ -452,7 +486,7 @@ function hate.special(ja, who, target)
     if ja == 272 then
         local m = hate.mobs[target];
         local e = m and m.list[who.key];
-        if e then e.ce, e.ve = 1, 0; end
+        if e then e.ce, e.ve = e.ce * 0.7, e.ve * 0.7; end
     elseif ja == 67 then
         local m = hate.mobs[target];
         local e = m and m.list[who.key];
@@ -534,6 +568,7 @@ local function parse_action(e)
                 elseif MISS[m] then record(src.who, base, 0, 'miss', abil); end
                 local extra = SC_MSG[ae_m];
                 if extra and ae_p > 0 then record(src.who, extra, ae_p, 'hit', nil); end
+                if cat == 4 and not src.pet then record_macc(src.who, not MRESIST[m]); end
             elseif src == nil and is_mob(actor, map) and map[target] and sp_m == 44 and sp_p > 0 then
                 record(map[target].who, 'Spikes', sp_p, 'hit', nil);   -- your spikes hit the monster
             end
@@ -740,8 +775,17 @@ local function report(channel)
     ui.chat_queue = { string.format('/%s [YunaDPS] %s  %s  %s dmg', channel, s.mode == 2 and 'Total' or 'Current', clock_text(dur), fmt(seg.sum)) };
     for i, a in ipairs(list) do
         if i > 5 then break; end
-        table.insert(ui.chat_queue, string.format('/%s %d. %s  %s dmg  %s DPS  (%d pct)', channel, i, a.name, fmt(a.total),
-            fmt(a.total / dur), math.floor((seg.sum > 0 and a.total / seg.sum * 100 or 0) + 0.5)));
+        -- damage, then accuracy (melee + ranged swings that hit) and magic accuracy (spells that landed), when there are any
+        local line = string.format('/%s %d. %s  %s dmg', channel, i, a.name, fmt(a.total));
+        local hits, swings = 0, 0;
+        for _, cat in ipairs({ 'Melee', 'Ranged' }) do
+            local c = a.cats[cat];
+            if c then hits, swings = hits + c.hits, swings + c.hits + c.miss; end
+        end
+        if swings > 0 then line = line .. string.format('  Acc %d', math.floor(hits / swings * 100 + 0.5)); end
+        local mc = a.macc;
+        if mc and mc.land + mc.miss > 0 then line = line .. string.format('  MAcc %d', math.floor(mc.land / (mc.land + mc.miss) * 100 + 0.5)); end
+        table.insert(ui.chat_queue, line);
     end
     ui.chat_next = 0;
 end
@@ -794,13 +838,10 @@ local function draw_header()
 
     -- Right: the view menu (Current / Total / Reset), then _ and X
     local ww = imgui.GetWindowWidth();
-    -- The DPS menu (Current / Total, Reset, Size), then the ENMITY tab, then _ and X
-    local dps_mode = (s.mode == 2 or (s.mode == 3 and s.last_dps == 2)) and 2 or 1;
+    -- The DPS menu (Current / Total, Reset), then the Enmity window button, then _ and X
     imgui.SetCursorPos({ ww - Z(72) - Z(80) - Z(126), oy + Z(13) });
     imgui.PushItemWidth(Z(120));
-    if s.mode == 3 then imgui.PushStyleColor(ImGuiCol_Text, C.muted); end   -- dimmed while the Enmity tab is open
-    local opened = imgui.BeginCombo('##ym_view', dps_mode == 2 and 'Total DPS' or 'Current DPS');
-    if s.mode == 3 then imgui.PopStyleColor(); end
+    local opened = imgui.BeginCombo('##ym_view', s.mode == 2 and 'Total DPS' or 'Current DPS');
     if opened then
         imgui.SetWindowFontScale(1.0);
         if imgui.Selectable('Current DPS', s.mode == 1) then s.mode = 1; settings.save(); end
@@ -809,15 +850,6 @@ local function draw_header()
         if imgui.IsItemHovered() then imgui.SetTooltip('Every fight since you loaded YunaDPS (or reset).\nDPS counts fight time only.'); end
         imgui.Separator();
         if imgui.Selectable('Reset numbers', false) then reset(); end
-        imgui.Separator();
-        imgui.TextColored(C.muted, 'Size');
-        if imgui.IsItemHovered() then imgui.SetTooltip('Bigger or smaller text and window (big screens: try Large).\nAlso: /dps size 50-250'); end
-        for _, o in ipairs({ { 'Small', 85 }, { 'Normal', 100 }, { 'Large', 125 }, { 'Extra large', 150 } }) do
-            if imgui.Selectable('  ' .. o[1] .. '##ym_size' .. o[2], (tonumber(s.size) or 100) == o[2]) then
-                s.size = o[2];
-                settings.save();
-            end
-        end
         imgui.EndCombo();
     end
     imgui.PopItemWidth();
@@ -829,20 +861,19 @@ local function draw_header()
         end
     end
 
-    -- ENMITY tab: lit while open; a second click goes back to the DPS view you had
-    local on = s.mode == 3;
+    -- Enmity: opens / closes the separate Enmity window (lit while it's open)
+    local on = s.hate == true;
     imgui.SetCursorPos({ ww - Z(72) - Z(78), oy + Z(13) });
     imgui.PushStyleColor(ImGuiCol_Button, on and { 0.85, 0.20, 0.22, 0.55 } or { 0.85, 0.20, 0.22, 0.12 });
     imgui.PushStyleColor(ImGuiCol_ButtonHovered, on and { 0.85, 0.20, 0.22, 0.70 } or { 0.85, 0.20, 0.22, 0.25 });
     imgui.PushStyleColor(ImGuiCol_ButtonActive, { 0.85, 0.20, 0.22, 0.80 });
     imgui.PushStyleColor(ImGuiCol_Text, on and { 1, 1, 1, 1 } or { 1.0, 0.62, 0.60, 1 });
     if imgui.Button('Enmity##ym_hate', { Z(72), Z(24) }) then
-        if on then s.mode = tonumber(s.last_dps) or 1; else s.last_dps, s.mode = dps_mode, 3; end
-        settings.save();
+        ui.toggle_hate();
     end
     imgui.PopStyleColor(4);
     if imgui.IsItemHovered() then
-        imgui.SetTooltip('Estimated enmity on your target (or the last monster fought).\nShows who the monster is attacking right now.');
+        imgui.SetTooltip((on and 'Close' or 'Open') .. ' the Enmity window: estimated enmity on your target and who the\nmonster is attacking right now. Drag it anywhere, next to this meter.');
     end
 
     imgui.SetCursorPos({ ww - Z(72), oy + Z(13) });
@@ -973,7 +1004,6 @@ local function draw_enmity_rows()
 end
 
 local function draw_rows()
-    if s.mode == 3 then draw_enmity_rows(); return; end
     local seg = segment();
     local list = roster_rows(seg);
     if #list == 0 then
@@ -1030,19 +1060,29 @@ local function remember_pos()
     if type(x) == 'number' and type(y) == 'number' then s.x, s.y = math.floor(x), math.floor(y); end
 end
 
+-- The meter's width sets the size of everything in it: at Normal it is 404 wide, and dragging the corner wider or
+-- narrower makes the text, bars and logo grow or shrink with it (that is the Size, saved as s.size). The height
+-- only decides how many rows show (saved at Normal size, s.h).
+local BASE_W = 404;
+
 local function draw_meter()
     if ui.place then
         imgui.SetNextWindowPos({ s.x, s.y }, ImGuiCond_Always);
-        imgui.SetNextWindowSize({ Z(s.w or 404), Z(s.h or 300) }, ImGuiCond_Always);
+        imgui.SetNextWindowSize({ Z(BASE_W), Z(s.h or 300) }, ImGuiCond_Always);
         ui.place = false;
     end
-    imgui.SetNextWindowSizeConstraints({ Z(370), Z(110) }, { 4000, 4000 });
+    imgui.SetNextWindowSizeConstraints({ BASE_W * 0.5, Z(110) }, { BASE_W * 2.5, 4000 });
     if imgui.Begin('YunaDPS##ym_main', ui.open, bit.bor(ImGuiWindowFlags_NoTitleBar, ImGuiWindowFlags_NoCollapse,
             ImGuiWindowFlags_NoScrollbar, ImGuiWindowFlags_NoScrollWithMouse)) then
         remember_pos();
         local ww, wh = imgui.GetWindowSize();
         if type(ww) == 'table' then ww, wh = ww.x or ww[1], ww.y or ww[2]; end
-        if type(ww) == 'number' and type(wh) == 'number' then ui.ww, s.w, s.h = ww, math.floor(ww / scale.k), math.floor(wh / scale.k); end   -- saved at 1080p size
+        if type(ww) == 'number' and type(wh) == 'number' then
+            -- dragged wider / narrower: the Size follows (no re-placing, so the drag isn't interrupted)
+            local k = math.max(0.5, math.min(2.5, ww / BASE_W));
+            if math.abs(k - scale.k) > 0.005 then scale.k, ui.k_main, s.size = k, k, math.floor(k * 100 + 0.5); end
+            ui.ww, ui.wh, s.h = ww, wh, math.floor(wh / scale.k);
+        end
         imgui.SetWindowFontScale(1.0);
         W = math.max(Z(200), (ui.ww or Z(404)) - Z(24));
         draw_header();
@@ -1057,23 +1097,28 @@ local function draw_meter()
     imgui.End();
 end
 
--- Minimized: just the logo and the top 3 under it. Click it to open the meter; drag it to move it.
-local function draw_mini()
-    if ui.place then imgui.SetNextWindowPos({ s.x, s.y }, ImGuiCond_Always); ui.place = false; end
+-- A minimized window: the logo with a top-3 card under it. Click it (no drag) to open the window again.
+--   o.id: window id   o.x, o.y: where it is   o.place: put it there this frame   o.list: rows { name, total, me, target }
+--   o.empty: text when the list is empty   o.tip: tooltip on the logo   o.moved(x, y): it was dragged
+--   o.restore(): it was clicked   o.hov: key in ui for the logo's hover state
+local function draw_mini_win(o)
+    if o.place then imgui.SetNextWindowPos({ o.x, o.y }, ImGuiCond_Always); end
     imgui.PushStyleVar(ImGuiStyleVar_WindowPadding, { Z(4), Z(4) });
     imgui.PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0);
-    if imgui.Begin('YunaDPS##ym_mini', ui.open, bit.bor(ImGuiWindowFlags_NoTitleBar, ImGuiWindowFlags_NoCollapse,
+    if imgui.Begin(o.id, { true }, bit.bor(ImGuiWindowFlags_NoTitleBar, ImGuiWindowFlags_NoCollapse,
             ImGuiWindowFlags_AlwaysAutoResize, ImGuiWindowFlags_NoScrollbar, ImGuiWindowFlags_NoBackground)) then
-        remember_pos();
+        local wx, wy = imgui.GetWindowPos();
+        if type(wx) == 'table' then wx, wy = wx.x or wx[1], wx.y or wx[2]; end
+        if type(wx) == 'number' and type(wy) == 'number' then wx, wy = math.floor(wx), math.floor(wy); o.moved(wx, wy); end
         imgui.SetWindowFontScale(1.0);
         local S, LW = Z(64), Z(150);                          -- logo size, width of the top-3 list under it
         local cx = imgui.GetCursorPosX();
         imgui.SetCursorPosX(cx + (LW - S) / 2);
-        ui.mini_hov = draw_logo(S, ui.mini_hov, fighting());
+        ui[o.hov] = draw_logo(S, ui[o.hov], fighting());
 
         -- Under the logo: the top 3 on a dark navy card (readable over snow, sky or spell effects),
         -- each letter outlined in black as well
-        local list = s.mode == 3 and hate.rows(hate.focus()) or sorted_actors(segment());
+        local list = o.list;
         imgui.SetWindowFontScale(0.95);
         local dl = imgui.GetWindowDrawList();
         local lh = imgui.GetTextLineHeight() + 2;
@@ -1084,61 +1129,194 @@ local function draw_mini()
         dl:AddRectFilled({ x, y }, { x + LW, y + rows * lh + Z(8) }, u32({ C.bg[1], C.bg[2], C.bg[3], 0.88 }), Z(6));
         dl:AddRect({ x, y }, { x + LW, y + rows * lh + Z(8) }, u32({ C.gold[1], C.gold[2], C.gold[3], 0.35 }), Z(6));
         local function outlined(px, py, col, text)
-            for _, o in ipairs({ { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }) do
-                put_text(px + o[1], py + o[2], { 0, 0, 0, 0.9 }, text);
+            for _, d in ipairs({ { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } }) do
+                put_text(px + d[1], py + d[2], { 0, 0, 0, 0.9 }, text);
             end
             put_text(px, py, col, text);
         end
-        if #list == 0 then outlined(x + (LW - text_w('YunaDPS')) / 2, y + Z(4), C.muted, 'YunaDPS'); end
+        if #list == 0 then outlined(x + (LW - text_w(o.empty)) / 2, y + Z(4), C.muted, o.empty); end
         for i = 1, math.min(3, #list) do
             local a, py = list[i], y + Z(4) + (i - 1) * lh;
             local name = tostring(a.name or '?');
             if #name > 11 then name = name:sub(1, 10) .. '.'; end
             local num = fmt(a.total);
             local col = a.me and { 0.76, 0.82, 1.0, 1 } or { 1, 1, 1, 1 };  -- you in light periwinkle
-            if a.target then col = { 1.0, 0.45, 0.42, 1 }; end            -- enmity view: who the monster is attacking
+            if a.target then col = { 1.0, 0.45, 0.42, 1 }; end            -- enmity: who the monster is attacking
             outlined(x + Z(7), py, C.gold, i .. '.');
             outlined(x + Z(7) + text_w('0. '), py, col, name);
             outlined(x + LW - Z(7) - text_w(num), py, col, num);
         end
         imgui.Dummy({ LW, rows * lh + Z(11) });
         imgui.SetWindowFontScale(1.0);
-        if ui.mini_hov then imgui.SetTooltip(string.format('YunaDPS - %s DPS\nClick to open, drag to move', fmt(my_dps()))); end
+        if ui[o.hov] then imgui.SetTooltip(o.tip); end
 
-        -- A click (not a drag) opens the meter again
+        -- A click (not a drag) opens the window again
         local hovered = imgui.IsWindowHovered();
-        if hovered and imgui.IsMouseClicked(0) then ui.press = { s.x, s.y }; end
-        if ui.press and imgui.IsMouseReleased(0) then
-            if hovered and math.abs(s.x - ui.press[1]) < 3 and math.abs(s.y - ui.press[2]) < 3 then
-                s.minimized, ui.place = false, true;
-                settings.save();
-            end
-            ui.press = nil;
+        local pk = o.hov .. '_press';
+        if hovered and imgui.IsMouseClicked(0) then ui[pk] = { wx, wy }; end
+        if ui[pk] and imgui.IsMouseReleased(0) then
+            if hovered and wx and math.abs(wx - ui[pk][1]) < 3 and math.abs(wy - ui[pk][2]) < 3 then o.restore(); end
+            ui[pk] = nil;
         end
     end
     imgui.End();
     imgui.PopStyleVar(2);
 end
 
--- The size everything is drawn at: the Size picked in the menu (or /dps size). Not taken from the screen:
+-- The meter minimized: logo + top 3 by damage
+local function draw_mini()
+    draw_mini_win({ id = 'YunaDPS##ym_mini', x = s.x, y = s.y, place = ui.place, list = sorted_actors(segment()),
+        empty = 'YunaDPS', hov = 'mini_hov',
+        tip = string.format('YunaDPS - %s DPS\nClick to open, drag to move', fmt(my_dps())),
+        moved = function(x, y) s.x, s.y = x, y; end,
+        restore = function() s.minimized, ui.place = false, true; settings.save(); end });
+    ui.place = false;
+end
+
+-- The Enmity window minimized: logo + top 3 by enmity, the one being attacked in red
+local function draw_hate_mini()
+    draw_mini_win({ id = 'YunaDPS Enmity##ym_hatemini', x = s.hx, y = s.hy, place = ui.hplace, list = hate.rows(hate.focus()),
+        empty = 'Enmity', hov = 'hmini_hov',
+        tip = 'Enmity - click to open, drag to move',
+        moved = function(x, y) s.hx, s.hy = x, y; end,
+        restore = function() s.hmin, ui.hplace = false, true; settings.save(); end });
+    ui.hplace = false;
+end
+
+-- The size everything is drawn at: s.size, which follows the meter's width. Not taken from the screen:
 -- the size ImGui reports can be far bigger than the monitor (game upscaling, Windows display scaling), which
 -- made the meter come up huge for some players. A change re-places the window at its new size.
 local function update_scale()
     local k = math.max(0.5, math.min(2.5, (tonumber(s.size) or 100) / 100));
-    if math.abs(k - scale.k) > 0.001 then scale.k, ui.place = k, true; end
+    if math.abs(k - (ui.k_main or 0)) > 0.011 then ui.k_main, ui.place = k, true; end   -- e.g. a size changed in the settings file
+    scale.k = ui.k_main;
+end
+
+-- The Enmity window: its own place and size, next to the meter or anywhere. Like the meter, its width sets the size
+-- of everything in it (saved as s.hsize; the height, s.hh, decides how many rows show).
+local HATE_W = BASE_W;   -- same base width as the meter, so the same size reads the same
+
+-- The attach / detach icon: two small cards, joined when attached, apart when detached. Returns true when clicked.
+local function attach_icon(attached)
+    local x, y = imgui.GetCursorScreenPos();
+    local w, h = Z(28), Z(24);
+    local clicked = imgui.InvisibleButton('##ym_attach', { w, h });
+    local hov = imgui.IsItemHovered();
+    local dl = imgui.GetWindowDrawList();
+    if hov then dl:AddRectFilled({ x, y }, { x + w, y + h }, u32({ 1, 1, 1, 0.08 }), Z(5)); end
+    local col = u32(hov and C.text or C.muted);
+    local cy, bw, bh = y + h / 2, Z(8), Z(11);
+    if attached then                                          -- two cards side by side, touching, with a link bar
+        dl:AddRect({ x + Z(5), cy - bh / 2 }, { x + Z(5) + bw, cy + bh / 2 }, col, Z(2), 0, Z(1.4));
+        dl:AddRect({ x + Z(15), cy - bh / 2 }, { x + Z(15) + bw, cy + bh / 2 }, col, Z(2), 0, Z(1.4));
+        dl:AddLine({ x + Z(11), cy }, { x + Z(17), cy }, col, Z(2));
+    else                                                      -- the same two cards pulled apart
+        dl:AddRect({ x + Z(3), cy - bh / 2 }, { x + Z(3) + bw, cy + bh / 2 }, col, Z(2), 0, Z(1.4));
+        dl:AddRect({ x + Z(17), cy - bh / 2 + Z(2) }, { x + Z(17) + bw, cy + bh / 2 + Z(2) }, col, Z(2), 0, Z(1.4));
+    end
+    if hov then
+        imgui.SetTooltip(attached and 'Attached to the DPS meter: it moves and sizes with it.\nClick to detach it (then move and resize it on its own).'
+            or 'Detached: move and resize it on its own.\nClick to attach it to the right of the DPS meter.');
+    end
+    return clicked;
+end
+
+-- attached: stuck to the right side of the DPS meter, at its size (it can't be moved or resized by itself)
+local function draw_hate_window(attached)
+    local open = { true };
+    local flags = bit.bor(ImGuiWindowFlags_NoTitleBar, ImGuiWindowFlags_NoCollapse, ImGuiWindowFlags_NoScrollbar,
+        ImGuiWindowFlags_NoScrollWithMouse);
+    if attached then
+        imgui.SetNextWindowPos({ s.x + ui.ww + Z(6), s.y }, ImGuiCond_Always);
+        imgui.SetNextWindowSize({ ui.ww, ui.wh or Z(300) }, ImGuiCond_Always);
+        flags = bit.bor(flags, ImGuiWindowFlags_NoMove, ImGuiWindowFlags_NoResize);
+        ui.hplace = false;
+    else
+        if ui.hplace then
+            imgui.SetNextWindowPos({ s.hx, s.hy }, ImGuiCond_Always);
+            imgui.SetNextWindowSize({ Z(HATE_W), Z(s.hh or 220) }, ImGuiCond_Always);
+            ui.hplace = false;
+        end
+        imgui.SetNextWindowSizeConstraints({ HATE_W * 0.5, Z(90) }, { HATE_W * 2.5, 4000 });
+    end
+    if imgui.Begin('YunaDPS Enmity##ym_hatewin', open, flags) then
+        local x, y = imgui.GetWindowPos();
+        if type(x) == 'table' then x, y = x.x or x[1], x.y or x[2]; end
+        if type(x) == 'number' and type(y) == 'number' then s.hx, s.hy = math.floor(x), math.floor(y); end
+        local ww, wh = imgui.GetWindowSize();
+        if type(ww) == 'table' then ww, wh = ww.x or ww[1], ww.y or ww[2]; end
+        if type(ww) == 'number' and type(wh) == 'number' and not attached then
+            local k = math.max(0.5, math.min(2.5, ww / HATE_W));
+            if math.abs(k - scale.k) > 0.005 then scale.k, ui.k_hate, s.hsize = k, k, math.floor(k * 100 + 0.5); end
+            s.hh = math.floor(wh / scale.k);
+        end
+        ww = ww or Z(HATE_W);
+        imgui.SetWindowFontScale(1.0);
+        -- header: the logo (click = minimize) and ENMITY on the left; attach / detach, _ and X on the right
+        local ox, oy = imgui.GetCursorPos();
+        local LS = Z(34);
+        ui.hlogo_hov = draw_logo(LS, ui.hlogo_hov, fighting());
+        if ui.hlogo_hov then imgui.SetTooltip('Click to shrink the Enmity window to this logo'); end
+        if ui.hlogo_hov and imgui.IsMouseClicked(0) then s.hmin, ui.hplace = true, true; settings.save(); end
+        imgui.SetCursorPos({ ox + LS + Z(8), oy + (LS - imgui.GetTextLineHeight()) / 2 });
+        imgui.TextColored({ 1.0, 0.45, 0.42, 1 }, 'ENMITY');
+        local by = oy + (LS - Z(24)) / 2;
+        imgui.SetCursorPos({ ww - Z(72) - Z(30), by });
+        if attach_icon(attached and true or false) then
+            if s.hattach ~= false then
+                s.hattach, s.hsize, s.hh = false, s.size or 100, s.h or 300;   -- detach where it is, at the meter's size
+                ui.k_hate = nil;
+            else
+                s.hattach = true;
+            end
+            settings.save();
+        end
+        imgui.SetCursorPos({ ww - Z(72), by });
+        if ghost_button('_##ym_hate_min', { Z(28), Z(24) }) then s.hmin, ui.hplace = true, true; settings.save(); end
+        if imgui.IsItemHovered() then imgui.SetTooltip('Shrink to the logo (with the top 3 under it)'); end
+        imgui.SameLine(0, 2);
+        if ghost_button('X##ym_hate_close', { Z(28), Z(24) }) then s.hate = false; settings.save(); end
+        if imgui.IsItemHovered() then imgui.SetTooltip('Close (the Enmity button on the meter opens it again)'); end
+        imgui.SetCursorPos({ ox, oy + LS + Z(4) });
+        if imgui.BeginChild('ym_hate_rows', { 0, 0 }, false) then
+            imgui.SetWindowFontScale(1.0);
+            W = math.max(Z(150), ww - Z(24) - Z(10));
+            draw_enmity_rows();
+        end
+        imgui.EndChild();
+    end
+    imgui.End();
 end
 
 local function draw_ui()
-    if not ui.open[1] then return; end
-    update_scale();
-    local nc, nv = push_theme();
-    local fp = push_font();
-    if s.minimized then draw_mini(); else draw_meter(); end
-    if fp then imgui.PopFont(); end
-    scale.f = 1;
-    imgui.PopStyleVar(nv);
-    imgui.PopStyleColor(nc);
-    if not ui.open[1] then s.visible = false; settings.save(); end
+    local fp = false;
+    if ui.open[1] then
+        update_scale();
+        local nc, nv = push_theme();
+        fp = push_font();
+        if s.minimized then draw_mini(); else draw_meter(); end
+        if fp then imgui.PopFont(); end
+        scale.f = 1;
+        imgui.PopStyleVar(nv);
+        imgui.PopStyleColor(nc);
+        if not ui.open[1] then s.visible = false; settings.save(); end
+    end
+    -- The Enmity window, at its own size (stays up while the meter is minimized or hidden)
+    if s.hate then
+        -- attached only while the DPS meter is up at full size; otherwise it stays where it is, on its own
+        local attached = s.hattach ~= false and not s.hmin and ui.open[1] and not s.minimized and ui.ww ~= nil;
+        local k = math.max(0.5, math.min(2.5, (tonumber(s.hsize) or 100) / 100));
+        if math.abs(k - (ui.k_hate or 0)) > 0.011 then ui.k_hate, ui.hplace = k, true; end
+        scale.k = attached and (ui.k_main or 1) or ui.k_hate;
+        local nc, nv = push_theme();
+        fp = push_font();
+        if s.hmin then draw_hate_mini(); else draw_hate_window(attached); end
+        if fp then imgui.PopFont(); end
+        scale.f = 1;
+        imgui.PopStyleVar(nv);
+        imgui.PopStyleColor(nc);
+        scale.k = ui.k_main or 1;
+    end
 end
 
 ----------------------------------------------------------------------------------------------------
@@ -1154,10 +1332,10 @@ local function show_help(loaded)
     for _, line in ipairs({
         '/dps  -  open or close the meter',
         '/dps min  -  shrink it to the logo and back (or click _ / the logo)',
-        '/dps current | total | enmity  -  switch view (also the menu and the Enmity tab)',
+        '/dps current | total  -  switch view (also the menu)',
+        '/dps enmity  -  open or close the Enmity window (also the Enmity button)',
         '/dps reset  -  clear every number',
         '/dps report [p | l | l2 | s | echo]  -  post the top 5 in party, linkshell... (or click the logo)',
-        '/dps size 50-250  -  bigger or smaller (also Size in the menu; no number = normal)',
         '/dps idle <seconds>  -  how long with no damage before a fight ends (now ' .. tostring(s.idle or 20) .. ')',
         '/dps help  -  this list',
     }) do msg(line); end
@@ -1219,19 +1397,9 @@ ashita.events.register('command', 'ym_command', function(e)
     elseif sub == 'fight' or sub == 'current' then
         s.mode = 1; settings.save();
     elseif sub == 'enmity' or sub == 'hate' then
-        if s.mode ~= 3 then s.last_dps = s.mode; end
-        s.mode = 3; settings.save();
+        ui.toggle_hate();
     elseif sub == 'total' then
         s.mode = 2; settings.save();
-    elseif sub == 'size' then
-        local v = tonumber(args[3]);
-        if v == nil then
-            s.size = 100;
-        else
-            s.size = math.max(50, math.min(250, math.floor(v)));
-        end
-        settings.save();
-        msg(string.format('Size %d%%.', s.size));
     elseif sub == 'idle' and tonumber(args[3]) then
         s.idle = math.max(5, math.min(120, math.floor(tonumber(args[3]))));
         settings.save();
