@@ -1,6 +1,6 @@
 addon.name    = 'yunadps';
 addon.author  = 'Yunas';
-addon.version = '1.0.2';
+addon.version = '1.0.3';
 addon.desc    = 'YunaDPS: damage meter for CatsEyeXI in the YunaGearOpt look. Minimizes to the YGO logo.';
 addon.link    = '';
 
@@ -401,10 +401,23 @@ function hate.add(m, who, ce, ve)
     e.ve = math.max(0, math.min(hate.CAP, e.ve + ve));
 end
 
-function hate.damage(id, who, dmg)
+-- Paladins tanking with YunaGearOpt wear its PLD Enmity set for Provoke, Flash, Reprisal, Atonement and other job
+-- abilities, and its Cure set (also Enmity+) for cures. That set comes to about +43 Enmity at level 75 (Ritter Gorget
+-- +3, 2x Pluto's Earring +6, Odium Ring +4, Iron Ram Sallet +5, Vlr. Surcoat +1 +5, Vlr. Gauntlets +1 +4,
+-- Cerb. Mantle +1 +4, Sattva Ring +3, Warwolf Belt +3, Kings Cuisses +3, Vlr. Leggings +1 +2, Charitoni Sling +1:
+-- CatsEyeXI item stats). +40 is used, for PLDs not fully geared. The server multiplies enmity by (100 + Enmity) / 100.
+-- Only for a main-job PLD, and only for those actions (melee is done in TP gear).
+hate.PLD_ENMITY = 40;
+function hate.bonus(who)
+    if who and who.job == 7 then return (100 + hate.PLD_ENMITY) / 100; end
+    return 1;
+end
+
+function hate.damage(id, who, dmg, mult)
     local d = hate.dmg_mod(hate.level());
     dmg = math.max(1, dmg);
-    hate.add(hate.mob(id), who, 80 / d * dmg, 240 / d * dmg);
+    mult = mult or 1;
+    hate.add(hate.mob(id), who, 80 / d * dmg * mult, 240 / d * dmg * mult);
 end
 
 -- Buffs, cures and self-target abilities: every monster that already hates the caster or the one helped
@@ -416,7 +429,8 @@ end
 
 function hate.cure(who, target_key, hp)
     local c = hate.cure_mod(hate.level());
-    hate.on_lists(who, 40 / c * hp, 240 / c * hp, target_key);
+    local b = hate.bonus(who);                                -- a PLD cures in its Enmity+ Cure set
+    hate.on_lists(who, 40 / c * hp * b, 240 / c * hp * b, target_key);
 end
 
 -- The monster hit a party member: that's who it's attacking, and they lose some CE
@@ -576,12 +590,15 @@ local function parse_action(e)
             -- Enmity
             if src and not src.pet then
                 if is_mob(target, map) then
-                    if HIT[m] and cat ~= 11 and cat ~= 13 then hate.damage(target, src.who, p); end
+                    if HIT[m] and cat ~= 11 and cat ~= 13 then
+                        -- Atonement: a PLD's weaponskill done in the Enmity set
+                        hate.damage(target, src.who, p, (cat == 3 and abil == 'Atonement') and hate.bonus(src.who) or 1);
+                    end
                     if SC_MSG[ae_m] and ae_p > 0 then hate.damage(target, src.who, ae_p); end
-                    if fixed then hate.add(hate.mob(target), src.who, fixed[1], fixed[2]); fixed = nil; end
+                    if fixed then local b = hate.bonus(src.who); hate.add(hate.mob(target), src.who, fixed[1] * b, fixed[2] * b); fixed = nil; end
                 elseif map[target] and not map[target].pet then
                     if cat == 4 and hate.CURE_MSG[m] and p > 0 then hate.cure(src.who, target, p); end
-                    if fixed then hate.on_lists(src.who, fixed[1], fixed[2], target); fixed = nil; end
+                    if fixed then local b = hate.bonus(src.who); hate.on_lists(src.who, fixed[1] * b, fixed[2] * b, target); fixed = nil; end
                 end
             elseif src == nil and is_mob(actor, map) and map[target] and not map[target].pet and (cat == 1 or cat == 11) then
                 hate.hit_taken(actor, map[target].who, HIT[m] and p or 0);

@@ -32,5 +32,5 @@ A damage meter for **CatsEyeXI** (Ashita v4 and VanaCore), in the same look as [
 ## Good to know
 
 - The game only sends combat messages for fights near you, so alliance members fighting far away show up once they're close.
-- Enmity is an **estimate**: other players' enmity gear can't be seen (it's taken as none) and the monster's level isn't known (your level is used). Who the monster is attacking (TARGET) is real.
+- Enmity is an **estimate**: other players' enmity gear can't be seen (it's taken as none, except main-job **Paladins**, who are counted with YunaGearOpt's PLD Enmity / Cure set, about +40 Enmity, for Provoke, Flash, Reprisal, other abilities, Atonement and cures) and the monster's level isn't known (your level is used). Who the monster is attacking (TARGET) is real.
 - `enmity_data.lua` holds the fixed enmity of every spell and job ability, taken from LandSandBoat's `spell_list.sql` and `abilities.sql`.
